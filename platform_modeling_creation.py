@@ -218,7 +218,7 @@ def aggregate_edge_features(edge_ids:list[int],edge_information_df:pd.DataFrame,
     road_classes_count = edge_features_df.groupby(ROAD_CLASS_COLUMN_NAME)[SPEED_COLUMN_NAME].count()
     average_speed = edge_features_df[SPEED_COLUMN_NAME].mean()
     
-    return_dict[f'{prefix} {unique_class}'] = average_speed
+    return_dict[f'{prefix} {SPEED_COLUMN_NAME}'] = average_speed
     for unique_class in unique_road_classes:
         return_dict[f'{prefix} {unique_class}'] = road_classes_count.get(unique_class,0)
     
