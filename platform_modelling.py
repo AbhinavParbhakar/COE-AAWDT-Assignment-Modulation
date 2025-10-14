@@ -3,10 +3,13 @@ from sklearn.compose._column_transformer import ColumnTransformer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 import numpy as np
 from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import GradientBoostingRegressor
+import mlflow
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.svm import SVR
-import torch 
-from sklearn.metrics import mean_absolute_percentage_error
+import sys
+import torch
+import xgboost
+from sklearn.metrics import mean_absolute_percentage_error, r2_score
 from torch.utils.data import DataLoader, TensorDataset
 from torch import nn
 import logging
@@ -26,33 +29,69 @@ class HyperParameters():
     def get_epochs(self):
         return self.epochs
 
-class NeuralNetwork(nn.Module):
-    def __init__(self,):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(in_features=18,out_features=180),
-            nn.ReLU(),
-            nn.Linear(in_features=180,out_features=90),
-            nn.ReLU(),
-            nn.Linear(in_features=90,out_features=45),
-            nn.ReLU(),
-            nn.Linear(in_features=45,out_features=15),
-            nn.ReLU(),
-            nn.Linear(in_features=15,out_features=1)
-        )
-    
-    def forward(self,x:torch.Tensor):
-        return self.model(x)
+    def get_params(self)->dict:
+        return {
+            'learning_rate' : self.learning_rate,
+            'weight_decay' : self.weight_decay,
+            'epochs' : self.epochs
+        }
 
-def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_parameters:HyperParameters):
+class NeuralNetwork(nn.Module):
+    def __init__(self,in_features):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features=in_features,out_features=1)
+        # self.relu = nn.ReLU()
+        # self.fc2 = nn.Linear(in_features=256,out_features=128)
+        # self.fc3 = nn.Linear(in_features=128,out_features=64)
+        # self.fc4 = nn.Linear(in_features=64,out_features=32)
+        # self.fc5 = nn.Linear(in_features=32,out_features=16)
+        # self.fc6 = nn.Linear(in_features=16,out_features=1)
+        
+    def forward(self,x:torch.Tensor):
+        x = self.fc1(x)
+        # x = self.relu(x)
+        
+        # x = self.fc2(x)
+        # x = self.relu(x)
+        
+        # x = self.fc3(x)
+        # x = self.relu(x)
+        
+        # x = self.fc4(x)
+        # x = self.relu(x)
+        
+        # x = self.fc5(x)
+        # x = self.relu(x)
+        
+        # x = self.fc6(x)
+        return x
+
+def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_parameters:HyperParameters,feature_dim:int)->tuple:
+    """
+    Train the DL model using the provided data and hyper parameters.
+    ### Parameters
+    1. train_loader : ``DataLoader``
+        - Contains the training samples
+    2. test_loader : ``DataLoader``
+        - Contains the test samples.
+    3. hyper_parameters : ``HyperParameters``
+        - Hyper parameters used for training
+    4. feature_dim : ``int``
+        - Specifies the dimension of the input features
+    
+    ### Returns
+    The last r2 score and MAPE score
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = NeuralNetwork().to(device=device)
+    model = NeuralNetwork(feature_dim).to(device=device)
+    validation_mape = 0
+    validation_r2_score = 0
     optim = torch.optim.Adam(
         params=model.parameters(),
         lr=hyper_parameters.get_learning_rate(),
         weight_decay=hyper_parameters.get_weight_decay()
     )
-    loss_function = nn.MSELoss().to(device)
+    loss_function = nn.HuberLoss().to(device)
         
     logging.basicConfig(level=logging.INFO)
     
@@ -63,7 +102,9 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
         validation_predictions = []
         validation_targets = []
         
-        for targets, features in train_loader:
+        model.train()
+        for features, targets in train_loader:
+            optim.zero_grad()
             features = features.to(device)
             targets : torch.Tensor = targets.to(device)
             prediction : torch.Tensor = model(features)
@@ -72,7 +113,6 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
             loss = loss_function(prediction,targets)
             loss.backward()
             optim.step()
-            optim.zero_grad()
         
         training_predictions_ndarray = np.concatenate(training_predictions,axis=0)
         training_targets_ndarray = np.concatenate(training_targets,axis=0)
@@ -83,7 +123,8 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
         training_mae = mean_absolute_percentage_error(training_targets_ndarray,training_predictions_ndarray)
         
         logging.info(msg=f"Training MAPE: {training_mae}, epoch: {i+1}")
-        for targets, features in test_loader:
+        model.eval()
+        for features, targets in test_loader:
             features = features.to(device)
             targets : torch.Tensor = targets.to(device)
             prediction : torch.Tensor = model(features)
@@ -96,23 +137,34 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
         validation_predictions_ndarrray = validation_predictions_ndarrray.reshape(validation_predictions_ndarrray.shape[0])
         validation_targets_ndarrray = validation_targets_ndarrray.reshape(validation_targets_ndarrray.shape[0])
         
-        validation_mae = mean_absolute_percentage_error(validation_targets_ndarrray,validation_predictions_ndarrray)
-    
-        logging.info(msg=f"Validation MAPE: {validation_mae}, epoch: {i+1}")
+        validation_mape = mean_absolute_percentage_error(validation_targets_ndarrray,validation_predictions_ndarrray)
+        validation_r2_score = r2_score(validation_targets_ndarrray,validation_predictions_ndarrray)
+        
+        print(f'Epoch {i+1}',f'R2: {validation_r2_score}',f'MAPE: {validation_mape}')
 
-def preprocess_data(data_df : pd.DataFrame, scaler: StandardScaler,training_set:False)->tuple[np.ndarray,np.ndarray]:
+    return validation_r2_score,validation_mape
+
+def preprocess_data(data_df : pd.DataFrame, scaler: StandardScaler,training_set:False,target_col:str,feature_cols:list[str])->tuple[np.ndarray,np.ndarray]:
     """
     Given the dataframe, return the target values, and features in a tuple after the application of preprocessing. 
     
     ### Parameters
     1. data_df : ``pd.DataFrame``
         - DataFrame contained both the features and target value.
+    2. scaler: ``StandardScaler``
+        - Scaler used to fit the training data, and transform the the training and test data.
+    3. training_set: ``bool``
+        - If ``True``, fits the scaler on the data and transforms it. Otherwise, simply transforms the data.
+    4. target_col : ``str``
+        - Name of the column containing the target values.
+    5. features_cols : ``list[str]``
+        - List of column names containing the features
     
     ### Returns
     Tuple in the form ``(features_ndarray, target_ndarray)``.
     """
-    target_ndarray = data_df['target_traffic_count'].to_numpy().reshape(-1,1)
-    features_df = data_df.drop(labels=['target_traffic_count'],axis=1)
+    target_ndarray = data_df[target_col].to_numpy().reshape(-1,1)
+    features_df = data_df[feature_cols]
     
     if training_set:
         features_ndarray = scaler.fit_transform(features_df)
@@ -157,34 +209,67 @@ def return_dataloader(features:np.ndarray,targets:np.ndarray,batch_size:int)->Da
     )
 
 if __name__ == "__main__":
-    data_file = "./data/Features_functional_road_classes.xlsx"
+    data_file = "./data/Node Information Rows Removed.xlsx"
     training_split = 0.8
+    
+    if len(sys.argv) == 1:
+        raise Exception("Please also pass in the name of the run as a command line argument")
+    
+    target_column_name = "target_traffic_count"
+    feature_columns = [
+        'Source Local','source_traffic_count','Summed Centrality',
+        'Access Point Local Centrality Scores',
+       'Access Point Collector Centrality Scores',
+       'Access Point Minor Arterial Centrality Scores',
+       'Access Point Other Centrality Scores',
+       'Access Point Major Arterial Centrality Scores',
+       'Source Collector', 'Source Minor Arterial', 'Source Other',
+       'Source Major Arterial', 'Source speed', 'Target Local',
+       'Target Collector', 'Target Minor Arterial', 'Target Other',
+       'Target Major Arterial', 'Target speed','Total Path Distance',
+       'Access Points Local', 'Access Points Collector',
+       'Access Points Minor Arterial', 'Access Points Other',
+       'Access Points Major Arterial','Path Local', 'Path Collector',
+       'Path Minor Arterial', 'Path Other', 'Path Major Arterial'
+    ]
+        
     
     train_split_df, test_split_df = train_test_split_df(data_file,train_split=training_split)
     
     scaler = StandardScaler()
     
-    x_train, y_train = preprocess_data(train_split_df,scaler=scaler,training_set=True)
-    x_test, y_test = preprocess_data(test_split_df,scaler=scaler,training_set=False)
+    x_train, y_train = preprocess_data(train_split_df,scaler=scaler,training_set=True,target_col=target_column_name,feature_cols=feature_columns)
+    x_test, y_test = preprocess_data(test_split_df,scaler=scaler,training_set=False,target_col=target_column_name,feature_cols=feature_columns)
     
-    regressor = GradientBoostingRegressor(loss='huber',n_estimators=200,learning_rate=0.02)
-    regressor.fit(x_train,y_train),
-    score = regressor.score(x_test,y_test)
-    print(score)
-    # # Deep Learning configuration
-    # batch_size = 16
+    # regressor = xgboost.XGBRegressor()
+    # regressor.fit(x_train,y_train),
+    # score = regressor.score(x_test,y_test)
+    # mape = mean_absolute_percentage_error(y_test,regressor.predict(x_test))
+    # print(mape)
+    # print(score)
+    # Deep Learning configuration
+    batch_size = 16
     
-    # hyper_parameters = HyperParameters(
-    #     learning_rate=0.005,
-    #     weight_decay=0.0001,
-    #     epochs=100
-    # )
+    mlflow.set_experiment("AAWDT Modulation - Deep Learning")
     
-    # train_dataloader : DataLoader = return_dataloader(x_train,y_train,batch_size=batch_size)
-    # test_dataloader : DataLoader = return_dataloader(x_test,y_test,batch_size=batch_size)
-    
-    # train_dl_model(
-    #     train_loader=train_dataloader,
-    #     test_loader=test_dataloader,
-    #     hyper_parameters=hyper_parameters
-    # )
+    with mlflow.start_run(run_name=sys.argv[-1]):
+        hyper_parameters = HyperParameters(
+            learning_rate=0.0005,
+            weight_decay=0.0,
+            epochs=100
+        )
+        mlflow.log_params(hyper_parameters.get_params())
+        mlflow.log_param('batch_size',batch_size)
+        
+        train_dataloader : DataLoader = return_dataloader(x_train,y_train,batch_size=batch_size)
+        test_dataloader : DataLoader = return_dataloader(x_test,y_test,batch_size=batch_size)
+        
+        r2_metric, mape_metric = train_dl_model(
+            train_loader=train_dataloader,
+            test_loader=test_dataloader,
+            hyper_parameters=hyper_parameters,
+            feature_dim=x_train.shape[-1]
+        )
+        
+        mlflow.log_metric('r2',r2_metric)
+        mlflow.log_metric('mape',mape_metric)
