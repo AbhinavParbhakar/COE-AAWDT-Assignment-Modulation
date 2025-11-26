@@ -8,11 +8,30 @@ from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.svm import SVR
 import sys
 import torch
+import matplotlib.pyplot as plt
 import xgboost
+from bayes_opt import BayesianOptimization
+from yaml import safe_load
 from sklearn.metrics import mean_absolute_percentage_error, r2_score
 from torch.utils.data import DataLoader, TensorDataset
 from torch import nn
 import logging
+from logging import Logger
+from pathlib import Path
+from dataclasses import dataclass, field
+from argparse import ArgumentParser
+import logging
+
+@dataclass
+class CLIArguments:
+    yaml_file_location : Path
+    experiment_name : str
+    run_name : str
+    log_folder : Path
+    logging_file_name : Path = field(init=False)
+    
+    def __post_init__(self):
+        self.logging_file_name = self.log_folder / self.experiment_name / self.run_name / '.log'
 
 class HyperParameters():
     def __init__(self,learning_rate,weight_decay,epochs):
@@ -37,34 +56,39 @@ class HyperParameters():
         }
 
 class NeuralNetwork(nn.Module):
-    def __init__(self,in_features):
+    def __init__(self,in_features:int):
         super().__init__()
-        self.fc1 = nn.Linear(in_features=in_features,out_features=1)
-        # self.relu = nn.ReLU()
-        # self.fc2 = nn.Linear(in_features=256,out_features=128)
-        # self.fc3 = nn.Linear(in_features=128,out_features=64)
-        # self.fc4 = nn.Linear(in_features=64,out_features=32)
-        # self.fc5 = nn.Linear(in_features=32,out_features=16)
-        # self.fc6 = nn.Linear(in_features=16,out_features=1)
+        assert isinstance(in_features,int), "Argument in_features not of type <int>"
         
-    def forward(self,x:torch.Tensor):
-        x = self.fc1(x)
-        # x = self.relu(x)
+        self.fc1 = nn.Linear(in_features=in_features,out_features=in_features * 2)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(in_features=in_features * 2,out_features=in_features * 4)
+        self.fc3 = nn.Linear(in_features=in_features * 4,out_features=in_features * 2)
+        self.fc4 = nn.Linear(in_features=in_features * 2,out_features=in_features)
+        self.fc5 = nn.Linear(in_features=in_features,out_features=in_features // 2)
+        self.fc6 = nn.Linear(in_features=in_features // 2,out_features=1)
         
-        # x = self.fc2(x)
-        # x = self.relu(x)
         
-        # x = self.fc3(x)
-        # x = self.relu(x)
+    def forward(self,input:torch.Tensor):
+        output_1 = self.fc1(input)
+        output_1 = self.relu(output_1)
         
-        # x = self.fc4(x)
-        # x = self.relu(x)
+        output_2 = self.fc2(output_1)
+        output_2 = self.relu(output_2)
         
-        # x = self.fc5(x)
-        # x = self.relu(x)
+        output_3 = self.fc3(output_2)
+        output_3 = self.relu(output_3)
+        output_3 = output_3 + output_1
         
-        # x = self.fc6(x)
-        return x
+        output_4 = self.fc4(output_3)
+        output_4 = self.relu(output_4)
+        output_4 = output_4 + input
+        
+        output_5 = self.fc5(output_4)
+        output_5 = self.relu(output_5)
+        
+        output_6 = self.fc6(output_5)
+        return output_6
 
 def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_parameters:HyperParameters,feature_dim:int)->tuple:
     """
@@ -86,6 +110,8 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
     model = NeuralNetwork(feature_dim).to(device=device)
     validation_mape = 0
     validation_r2_score = 0
+    training_mape_scores = []
+    validation_mape_scores = []
     optim = torch.optim.Adam(
         params=model.parameters(),
         lr=hyper_parameters.get_learning_rate(),
@@ -121,6 +147,7 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
         training_targets_ndarray = training_targets_ndarray.reshape(training_targets_ndarray.shape[0])
         
         training_mae = mean_absolute_percentage_error(training_targets_ndarray,training_predictions_ndarray)
+        training_mape_scores.append(training_mae)
         
         logging.info(msg=f"Training MAPE: {training_mae}, epoch: {i+1}")
         model.eval()
@@ -138,13 +165,25 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
         validation_targets_ndarrray = validation_targets_ndarrray.reshape(validation_targets_ndarrray.shape[0])
         
         validation_mape = mean_absolute_percentage_error(validation_targets_ndarrray,validation_predictions_ndarrray)
+        validation_mape_scores.append(validation_mape)
         validation_r2_score = r2_score(validation_targets_ndarrray,validation_predictions_ndarrray)
         
         print(f'Epoch {i+1}',f'R2: {validation_r2_score}',f'MAPE: {validation_mape}')
 
+    fig, ax = plt.subplots()
+        
+    ax.grid(visible=True)
+    ax.set_title('Training vs. Validation MAPE')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Mean Average Percent Error')
+    ax.plot([i+1 for i in range(len(training_mape_scores))],training_mape_scores,'b')
+    ax.plot([i+1 for i in range(len(validation_mape_scores))],validation_mape_scores,'g')
+    ax.legend()
+    
+    fig.savefig('./data/training_validation_mape_graph.png')
     return validation_r2_score,validation_mape
 
-def preprocess_data(data_df : pd.DataFrame, scaler: StandardScaler,training_set:False,target_col:str,feature_cols:list[str])->tuple[np.ndarray,np.ndarray]:
+def preprocess_data(data_df : pd.DataFrame, scaler: StandardScaler,target_col:str,feature_cols:list[str],training_set=False,)->tuple[np.ndarray,np.ndarray]:
     """
     Given the dataframe, return the target values, and features in a tuple after the application of preprocessing. 
     
@@ -173,7 +212,7 @@ def preprocess_data(data_df : pd.DataFrame, scaler: StandardScaler,training_set:
 
     return features_ndarray.astype(np.float32), target_ndarray.astype(np.float32),
     
-def train_test_split_df(file_path:str,train_split:float)->tuple[pd.DataFrame,pd.DataFrame]:
+def train_test_split_df(file_path:Path,train_split:float)->tuple[pd.DataFrame,pd.DataFrame]:
     """
     Given the file path, create a DataFrame object and split it into two based on the split threshold, and return the
     split DataFrames.
@@ -208,30 +247,28 @@ def return_dataloader(features:np.ndarray,targets:np.ndarray,batch_size:int)->Da
         batch_size=batch_size
     )
 
+def setup_logger(file_name:Path)->Logger:
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(filename=file_name,filemode='w',datefmt='%m-%d-%Y %H-%M',level=logging.INFO)
+    
+    return logger
+
+def setup_cli()->ArgumentParser:
+    parser = ArgumentParser()
+    parser.add_argument("YAML Config File Location")
+    parser.add_argument("MLFlow Experiment name")
+    parser.add_argument("Run Name")
+    return parser
+
 if __name__ == "__main__":
-    data_file = "./data/Node Information Rows Removed.xlsx"
+    cli = setup_cli()
+    data_file = vars(cli.parse_args())
     training_split = 0.8
     
     if len(sys.argv) == 1:
         raise Exception("Please also pass in the name of the run as a command line argument")
     
     target_column_name = "target_traffic_count"
-    feature_columns = [
-        'Source Local','source_traffic_count','Summed Centrality',
-        'Access Point Local Centrality Scores',
-       'Access Point Collector Centrality Scores',
-       'Access Point Minor Arterial Centrality Scores',
-       'Access Point Other Centrality Scores',
-       'Access Point Major Arterial Centrality Scores',
-       'Source Collector', 'Source Minor Arterial', 'Source Other',
-       'Source Major Arterial', 'Source speed', 'Target Local',
-       'Target Collector', 'Target Minor Arterial', 'Target Other',
-       'Target Major Arterial', 'Target speed','Total Path Distance',
-       'Access Points Local', 'Access Points Collector',
-       'Access Points Minor Arterial', 'Access Points Other',
-       'Access Points Major Arterial','Path Local', 'Path Collector',
-       'Path Minor Arterial', 'Path Other', 'Path Major Arterial'
-    ]
         
     
     train_split_df, test_split_df = train_test_split_df(data_file,train_split=training_split)
@@ -250,14 +287,52 @@ if __name__ == "__main__":
     # Deep Learning configuration
     batch_size = 16
     
-    mlflow.set_experiment("AAWDT Modulation - Deep Learning")
+    mlflow.set_tracking_uri('http://127.0.0.1:8080')
+    experiment = mlflow.set_experiment("AAWDT Modulation - Deep Learning")
     
-    with mlflow.start_run(run_name=sys.argv[-1]):
+    bounds = {
+        'n_estimators' : (100,500),
+        'max_depth' : (1,1000),
+        'min_samples_split' : (2,100),
+        'min_samples_leaf' : (0.01,0.99),
+        'min_weight_fraction_leaf' : (0,0.5)
+    }
+    
+    def optimize_r2(n_estimators,max_depth,min_samples_split,min_samples_leaf,min_weight_fraction_leaf):
+        model = RandomForestRegressor(
+            n_estimators=int(n_estimators),
+            max_depth=int(max_depth),
+            min_samples_split=int(min_samples_split),
+            min_samples_leaf=min_samples_leaf,
+            min_weight_fraction_leaf=min_weight_fraction_leaf,
+            criterion='squared_error'
+        )
+        model.fit(x_train,y_train)
+        r2 = r2_score(y_test,model.predict(x_test))
+        return r2
+    
+    # optim = BayesianOptimization(
+    #     f=optimize_r2,
+    #     pbounds=bounds,
+    #     random_state=1
+    # )
+    
+    # optim.maximize(
+    #     init_points=100,
+    #     n_iter=100,
+        
+    # )
+    
+    
+    
+    with mlflow.start_run(run_name=sys.argv[-1]) as run:
+        
         hyper_parameters = HyperParameters(
-            learning_rate=0.0005,
-            weight_decay=0.0,
+            learning_rate=0.001,
+            weight_decay=0.05,
             epochs=100
         )
+        
         mlflow.log_params(hyper_parameters.get_params())
         mlflow.log_param('batch_size',batch_size)
         
