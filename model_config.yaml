@@ -2,9 +2,9 @@ data_file_name: "./data/Node Information Rows Removed.xlsx"
 ml_flow_endpoint: 'http://127.0.0.1:8080'
 
 hyper_parameters:
-  learning_rate: 0.01
+  learning_rate: 0.005
   epochs: 100
-  batch_size: 16
+  batch_size: 8
   weight_decay: 0.05
 
 training_details:

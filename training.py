@@ -6,6 +6,9 @@ from sklearn.linear_model import LinearRegression
 import mlflow
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.svm import SVR
+from typing import Protocol, TypedDict
+from typing import Any
+from provider_types import YAMLconfig
 import sys
 import torch
 import matplotlib.pyplot as plt
@@ -18,20 +21,17 @@ from torch import nn
 import logging
 from logging import Logger
 from pathlib import Path
-from dataclasses import dataclass, field
-from argparse import ArgumentParser
-import logging
+from providers import ArgParseCLI, GraphGenerator, PltPlotter
 
-@dataclass
-class CLIArguments:
-    yaml_file_location : Path
-    experiment_name : str
-    run_name : str
-    log_folder : Path
-    logging_file_name : Path = field(init=False)
+class TrainingResults(TypedDict):
+    r2_score : float
+    mape : float
+    mae : float
+
+class ModelTrainer(Protocol):
+    def train(self)->None:...
     
-    def __post_init__(self):
-        self.logging_file_name = self.log_folder / self.experiment_name / self.run_name / '.log'
+    def return_training_results(self)->TrainingResults:...
 
 class HyperParameters():
     def __init__(self,learning_rate,weight_decay,epochs):
@@ -90,7 +90,7 @@ class NeuralNetwork(nn.Module):
         output_6 = self.fc6(output_5)
         return output_6
 
-def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_parameters:HyperParameters,feature_dim:int)->tuple:
+def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_parameters:HyperParameters,feature_dim:int,logger:Logger, grapher:GraphGenerator)->tuple:
     """
     Train the DL model using the provided data and hyper parameters.
     ### Parameters
@@ -102,6 +102,8 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
         - Hyper parameters used for training
     4. feature_dim : ``int``
         - Specifies the dimension of the input features
+    5. logger : ``Logger``
+        - Used to log data
     
     ### Returns
     The last r2 score and MAPE score
@@ -118,9 +120,7 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
         weight_decay=hyper_parameters.get_weight_decay()
     )
     loss_function = nn.HuberLoss().to(device)
-        
-    logging.basicConfig(level=logging.INFO)
-    
+            
     for i in range(hyper_parameters.get_epochs()):
         training_predictions = []
         training_targets = []
@@ -146,10 +146,11 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
         training_predictions_ndarray = training_predictions_ndarray.reshape(training_predictions_ndarray.shape[0])
         training_targets_ndarray = training_targets_ndarray.reshape(training_targets_ndarray.shape[0])
         
-        training_mae = mean_absolute_percentage_error(training_targets_ndarray,training_predictions_ndarray)
-        training_mape_scores.append(training_mae)
+        training_mape = mean_absolute_percentage_error(training_targets_ndarray,training_predictions_ndarray)
+        training_r2 = r2_score(training_targets_ndarray,training_predictions_ndarray)
+        training_mape_scores.append(training_mape)
         
-        logging.info(msg=f"Training MAPE: {training_mae}, epoch: {i+1}")
+        logger.info(f"Epoch {i+1}: Training R2: {training_r2} Training MAPE: {training_mape}")
         model.eval()
         for features, targets in test_loader:
             features = features.to(device)
@@ -168,19 +169,22 @@ def train_dl_model(train_loader:DataLoader,test_loader:DataLoader,hyper_paramete
         validation_mape_scores.append(validation_mape)
         validation_r2_score = r2_score(validation_targets_ndarrray,validation_predictions_ndarrray)
         
-        print(f'Epoch {i+1}',f'R2: {validation_r2_score}',f'MAPE: {validation_mape}')
+        logger.info(f"Epoch {i+1}: Validation R2: {validation_r2_score} Validation MAPE: {validation_mape}\n\n")
 
-    fig, ax = plt.subplots()
-        
-    ax.grid(visible=True)
-    ax.set_title('Training vs. Validation MAPE')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Mean Average Percent Error')
-    ax.plot([i+1 for i in range(len(training_mape_scores))],training_mape_scores,'b')
-    ax.plot([i+1 for i in range(len(validation_mape_scores))],validation_mape_scores,'g')
-    ax.legend()
+    grapher.create_single_metric_comparison_graph(
+        save_path = Path('./data/training_validation_mape_graph.png'),
+        shared_x_values = [i+1 for i in range(len(training_mape_scores))],
+        metric_name = 'Mean Average Percent Error',
+        series_values = [
+            training_mape_scores,
+            validation_mape_scores
+        ],
+        series_labels = [
+            'Training',
+            'Validation'
+        ]
+    )
     
-    fig.savefig('./data/training_validation_mape_graph.png')
     return validation_r2_score,validation_mape
 
 def preprocess_data(data_df : pd.DataFrame, scaler: StandardScaler,target_col:str,feature_cols:list[str],training_set=False,)->tuple[np.ndarray,np.ndarray]:
@@ -247,28 +251,41 @@ def return_dataloader(features:np.ndarray,targets:np.ndarray,batch_size:int)->Da
         batch_size=batch_size
     )
 
-def setup_logger(file_name:Path)->Logger:
+
+def return_yaml_config(path:Path)->YAMLconfig:
+    with open(path) as f:
+        config = YAMLconfig.from_yaml(f)
+        if isinstance(config,list):
+            raise ValueError("YAML Config returned as a list of objects")
+        return config
+
+def return_logger(logging_folder:Path,log_file_name:str)->Logger:
+    log_path = logging_folder / f'{log_file_name}.log'
     logger = logging.getLogger(__name__)
-    logging.basicConfig(filename=file_name,filemode='w',datefmt='%m-%d-%Y %H-%M',level=logging.INFO)
+    logging.basicConfig(filename=log_path,filemode='w',datefmt='%m-%d-%Y %H-%M',level=logging.INFO)
     
     return logger
 
-def setup_cli()->ArgumentParser:
-    parser = ArgumentParser()
-    parser.add_argument("YAML Config File Location")
-    parser.add_argument("MLFlow Experiment name")
-    parser.add_argument("Run Name")
-    return parser
-
 if __name__ == "__main__":
-    cli = setup_cli()
-    data_file = vars(cli.parse_args())
+    cli = ArgParseCLI()
+    fields = cli.get_cli_arguments()
+    yaml_config : YAMLconfig = return_yaml_config(fields.yaml_file_location)
+    log_folder = fields.log_folder
+    experiment_name = fields.experiment_name
+    run_name = fields.run_name
+    
+    experiment_log_folder = log_folder / experiment_name
+    if not experiment_log_folder.exists():
+        experiment_log_folder.mkdir()
+        
+    logger = return_logger(experiment_log_folder,run_name)
+    
     training_split = 0.8
     
-    if len(sys.argv) == 1:
-        raise Exception("Please also pass in the name of the run as a command line argument")
-    
-    target_column_name = "target_traffic_count"
+    target_column_name = yaml_config.training_details.target_column
+    data_file = Path(yaml_config.data_file_name)
+    feature_columns = yaml_config.training_details.feature_columns
+    tracking_uri = yaml_config.ml_flow_endpoint
         
     
     train_split_df, test_split_df = train_test_split_df(data_file,train_split=training_split)
@@ -285,10 +302,10 @@ if __name__ == "__main__":
     # print(mape)
     # print(score)
     # Deep Learning configuration
-    batch_size = 16
+    batch_size = yaml_config.hyper_parameters.batch_size
     
-    mlflow.set_tracking_uri('http://127.0.0.1:8080')
-    experiment = mlflow.set_experiment("AAWDT Modulation - Deep Learning")
+    mlflow.set_tracking_uri(tracking_uri)
+    experiment = mlflow.set_experiment(experiment_name)
     
     bounds = {
         'n_estimators' : (100,500),
@@ -311,11 +328,11 @@ if __name__ == "__main__":
         r2 = r2_score(y_test,model.predict(x_test))
         return r2
     
-    # optim = BayesianOptimization(
-    #     f=optimize_r2,
-    #     pbounds=bounds,
-    #     random_state=1
-    # )
+    optim = BayesianOptimization(
+        f=optimize_r2,
+        pbounds=bounds,
+        random_state=1
+    )
     
     # optim.maximize(
     #     init_points=100,
@@ -325,12 +342,12 @@ if __name__ == "__main__":
     
     
     
-    with mlflow.start_run(run_name=sys.argv[-1]) as run:
+    with mlflow.start_run(run_name=run_name) as run:
         
         hyper_parameters = HyperParameters(
-            learning_rate=0.001,
-            weight_decay=0.05,
-            epochs=100
+            learning_rate= yaml_config.hyper_parameters.learning_rate,
+            weight_decay= yaml_config.hyper_parameters.weight_decay,
+            epochs= yaml_config.hyper_parameters.epochs
         )
         
         mlflow.log_params(hyper_parameters.get_params())
@@ -339,12 +356,17 @@ if __name__ == "__main__":
         train_dataloader : DataLoader = return_dataloader(x_train,y_train,batch_size=batch_size)
         test_dataloader : DataLoader = return_dataloader(x_test,y_test,batch_size=batch_size)
         
+        plt_plotter = PltPlotter()
         r2_metric, mape_metric = train_dl_model(
             train_loader=train_dataloader,
             test_loader=test_dataloader,
             hyper_parameters=hyper_parameters,
-            feature_dim=x_train.shape[-1]
+            feature_dim=x_train.shape[-1],
+            logger=logger,
+            grapher = plt_plotter
         )
         
         mlflow.log_metric('r2',r2_metric)
         mlflow.log_metric('mape',mape_metric)
+        for graph_path in plt_plotter.get_create_graphs():
+            mlflow.log_artifact(str(graph_path))

@@ -1,40 +1,57 @@
 from typing import Protocol
-from dataclasses import dataclass, field
 from pathlib import Path
 from argparse import ArgumentParser
-from enum import StrEnum
+import matplotlib.pyplot as plt
+from matplotlib.colors import BASE_COLORS
 
-class CLIArguments(StrEnum):
-    yaml_file_location = "YAML Config File Location"
-    experiment_name = "MLFlow Experiment name"
-    run_name = "Run Name"
-    logging_folder = "Logging Folder"
+from provider_types import CLIArguments, CLIFields
 
-
-
-@dataclass
-class CLIFields:
-    yaml_file_location : Path
-    experiment_name : str
-    run_name : str
-    log_folder : Path
-    logging_file_name : Path = field(init=False)
-    
-    def __post_init__(self):
-        if not self.yaml_file_location.exists():
-            FileNotFoundError(f"File {self.yaml_file_location} not found.")
-        
-        if not self.log_folder.exists():
-            FileNotFoundError(f'Direction {self.log_folder} not found.')
-        
-        self.logging_file_name = self.log_folder / self.experiment_name / self.run_name / '.log'
 
 class CLI(Protocol):
     def get_cli_arguments(self)->CLIFields:...
 
+class GraphGenerator(Protocol):
+    def create_single_metric_comparison_graph(self,save_path: Path, shared_x_values:list, metric_name: str, series_values: list[list[float]], series_labels: list[str])->None:...
+
+    def get_create_graphs(self)->list[Path]:...
+    
+class PltPlotter:
+    def __init__(self) -> None:
+        self._created_graphs : list[Path] = []
+    
+    def get_create_graphs(self)->list[Path]:
+        return self._created_graphs
+        
+    def create_single_metric_comparison_graph(self,save_path: Path, shared_x_values:list, metric_name: str, series_values: list[list[float]], series_labels: list[str])->None:
+        if len(series_labels) < 1:
+            raise ValueError("At least one series must be provided")
+        
+        if len(series_values) != len(series_labels):
+            raise ValueError(f"Length of {len(series_values)} for series_values does not match length {len(series_labels)} of series_labels.")
+        
+        fig, ax = plt.subplots()
+        ax.grid()
+        ax.set_title(f'{metric_name} over epochs')
+        ax.set_ylabel(metric_name)
+        ax.set_xlabel('Epochs')
+        base_color_names = list(BASE_COLORS.keys())
+        number_of_base_colors = len(base_color_names)
+        
+        prev_size = len(series_values[0])
+        
+        for i,series in enumerate(series_values):
+            if len(series) != prev_size:
+                raise ValueError(f'All lists provided in the series_values argument must be of equal size. Found heterogeneity.')
+
+            ax.plot(shared_x_values,series, base_color_names[i % number_of_base_colors], label=series_labels[i])
+        
+        ax.legend()
+        fig.savefig(save_path)
+        self._created_graphs.append(save_path)
+
 class ArgParseCLI:
     def __init__(self) -> None:
-        self.parser = self._setup_cli()
+        self._parser = self._setup_cli()
     
     def _setup_cli(self)->ArgumentParser:
         parser = ArgumentParser()
@@ -45,7 +62,7 @@ class ArgParseCLI:
         return parser
     
     def get_cli_arguments(self)->CLIFields:
-        field_values = vars(self.parser.parse_args())
+        field_values = vars(self._parser.parse_args())
         
         yaml_location_path = Path(field_values[CLIArguments.yaml_file_location.value])
         experiment_name = field_values[CLIArguments.experiment_name.value]
